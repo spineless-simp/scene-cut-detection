@@ -142,7 +142,7 @@ def process_video(
         input_path=str(input_path),
         analysis_width=width,
         analysis_height=height,
-        gray=True,
+        pix_fmt="gray",
     )
     
     # Initialize detector

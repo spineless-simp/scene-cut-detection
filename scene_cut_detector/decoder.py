@@ -2,8 +2,12 @@
 
 import subprocess
 import sys
+import threading
+import re
 from dataclasses import dataclass
 from typing import Iterator, Optional
+
+import numpy as np
 
 
 @dataclass
@@ -37,62 +41,57 @@ class VideoDecoder:
         self,
         input_path: str,
         analysis_width: int,
-        analysis_height: int,
-        gray: bool = True,
-        pix_fmt: str = "gray" if sys.byteorder == "little" else "gray",
+        analysis_height: Optional[int] = None,
+        pix_fmt: str = "rgb24",
     ):
-        """Initialize the decoder with video source and analysis parameters.
+        """Initialize the video decoder.
         
         Args:
-            input_path: Path to the input video file.
-            analysis_width: Width to downscale frames to for analysis.
-            analysis_height: Height to downscale frames to for analysis.
-            gray: Whether to convert to grayscale (recommended for efficiency).
-            pix_fmt: Pixel format for output ('gray' or 'rgb24').
+            input_path: Path to the input video file
+            analysis_width: Width to downscale frames to for analysis
+            analysis_height: Optional height to downscale frames to (defaults to None, maintains aspect ratio)
+            pix_fmt: Pixel format for output ("gray" or "rgb24")
         """
+        import os
+        
         self.input_path = input_path
         self.analysis_width = analysis_width
         self.analysis_height = analysis_height
-        self.gray = gray
-        self.pix_fmt = "gray" if gray else "rgb24"
+        self.pix_fmt = pix_fmt
         self._process: Optional[subprocess.Popen[bytes]] = None
         self._info: Optional[VideoInfo] = None
+        self._original_width: Optional[int] = None
+        self._original_height: Optional[int] = None
         
-    def __enter__(self):
-        """Context manager entry - start the FFmpeg process."""
-        self.start()
-        return self
+        if not os.path.exists(input_path):
+            raise FileNotFoundError(f"Input file not found: {input_path}")
+            
+        import time
+        import json
         
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit - clean up FFmpeg process."""
-        self.stop()
-        return False
+        # First, get video info without starting the full decoder
+        self._original_width, self._original_height = self._get_original_dimensions(input_path)
         
-    def start(self) -> None:
-        """Start the FFmpeg decoding process."""
-        # Build FFmpeg command for streaming decode with downscaling
-        # We use:
-        # -vf: Video filters for scaling and grayscale conversion
-        # -f rawvideo: Output raw video to stdout
-        # -pix_fmt: Output pixel format (gray or rgb24)
-        # -loglevel error: Minimize log output, only show errors
-        # -hide_banner: Hide FFmpeg banner
+        # Get duration and frame rate using ffprobe
+        duration, avg_frame_rate = self._get_video_metadata(input_path)
         
-        filters = f"scale={self.analysis_width}:{self.analysis_height}"
-        if self.gray:
-            filters += ",format=gray"
+        # Calculate the actual output dimensions
+        if self.analysis_height is None and self._original_width and self._original_height:
+            # Maintain aspect ratio
+            aspect_ratio = self._original_height / self._original_width
+            self.analysis_height = int(self.analysis_width * aspect_ratio)
+        elif self.analysis_height is None:
+            # Fallback default
+            self.analysis_height = 240
         
+        # Build FFmpeg command
         cmd = [
             "ffmpeg",
-            "-nostdin",  # Don't read from stdin
-            "-nostats",  # Don't print progress info
-            "-hide_banner",
-            "-loglevel", "error",
-            "-i", self.input_path,
-            "-vf", filters,
-            "-pix_fmt", self.pix_fmt,
+            "-i", input_path,
+            "-vf", f"scale={analysis_width}:{self.analysis_height}",
+            "-pix_fmt", pix_fmt,
             "-f", "rawvideo",
-            "pipe:1",  # Output to stdout
+            "-",
         ]
         
         self._process = subprocess.Popen(
@@ -102,58 +101,183 @@ class VideoDecoder:
             bufsize=1024 * 1024,  # 1MB buffer for stdout
         )
         
-        # Parse video info from stderr
-        self._info = self._parse_video_info()
+        # Start thread to read stderr asynchronously
+        self._stderr_output: list[bytes] = []
+        self._stderr_lock = threading.Lock()
+        self._stderr_thread = threading.Thread(target=self._read_stderr, daemon=True)
+        self._stderr_thread.start()
         
+        # Wait briefly for stderr to be populated
+        time.sleep(0.1)
+        
+        # Parse video info (fill in any missing metadata from stderr)
+        parsed_info = self._parse_video_info()
+        
+        # Use ffprobe values if stderr parsing didn't find them
+        self._info = VideoInfo(
+            width=self.analysis_width,
+            height=self.analysis_height,
+            duration=duration if duration else parsed_info.duration,
+            avg_frame_rate=avg_frame_rate if avg_frame_rate else parsed_info.avg_frame_rate,
+            pixel_format=pix_fmt,
+            stream_index=0,
+        )
+        
+    def _read_stderr(self) -> None:
+        """Read stderr in a separate thread to avoid blocking."""
+        if self._process and self._process.stderr:
+            try:
+                while True:
+                    line = self._process.stderr.read(1024)
+                    if not line:
+                        break
+                    with self._stderr_lock:
+                        self._stderr_output.append(line)
+            except Exception:
+                pass
+                
+    def _get_original_dimensions(self, input_path: str) -> tuple[Optional[int], Optional[int]]:
+        """Get original video dimensions using ffprobe."""
+        import json
+        
+        cmd = [
+            "ffprobe",
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "json",
+            input_path
+        ]
+        
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            if result.returncode == 0:
+                data = json.loads(result.stdout)
+                stream = data.get("streams", [{}])[0]
+                width = stream.get("width")
+                height = stream.get("height")
+                return int(width), int(height)
+        except Exception:
+            pass
+            
+        # Fallback: use ffmpeg to get dimensions
+        cmd = [
+            "ffmpeg",
+            "-i", input_path,
+            "-v", "quiet",
+            "-an",
+            "-vframes", "1",
+            "-f", "rawvideo",
+            "-pix_fmt", "rgb24",
+            "-"
+        ]
+        
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            _, stderr = proc.communicate(timeout=5)
+            
+            # Parse dimensions from stderr
+            dim_match = re.search(r"Stream.*Video:.*(\\d+)x(\\d+)", stderr.decode("utf-8", errors="replace"))
+            if dim_match:
+                return int(dim_match.group(1)), int(dim_match.group(2))
+        except Exception:
+            pass
+            
+        return None, None
+    
+    def _get_video_metadata(self, input_path: str) -> tuple[Optional[float], Optional[float]]:
+        """Get video duration and frame rate using ffprobe."""
+        import json
+        
+        cmd = [
+            "ffprobe",
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=duration,r_frame_rate",
+            "-of", "json",
+            input_path
+        ]
+        
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            if result.returncode == 0:
+                data = json.loads(result.stdout)
+                stream = data.get("streams", [{}])[0]
+                
+                # Get duration
+                duration_str = stream.get("duration")
+                duration = float(duration_str) if duration_str else None
+                
+                # Get frame rate (r_frame_rate is usually more accurate for variable frame rate)
+                frame_rate_str = stream.get("r_frame_rate")
+                avg_frame_rate = None
+                if frame_rate_str and "/" in frame_rate_str:
+                    try:
+                        num, denom = frame_rate_str.split("/")
+                        avg_frame_rate = float(num) / float(denom)
+                    except (ValueError, ZeroDivisionError):
+                        pass
+                
+                return duration, avg_frame_rate
+        except Exception:
+            pass
+            
+        return None, None
+    
     def _parse_video_info(self) -> VideoInfo:
-        """Parse video information from FFmpeg stderr.
-        
-        We read stderr to get video metadata, but we need to be careful
-        not to block waiting for the full stderr output.
-        """
+        """Parse video information from FFmpeg stderr."""
         import re
         
         if self._process is None:
             raise RuntimeError("Process not started")
             
-        # Read stderr to get video info
-        # FFmpeg outputs info to stderr before decoding starts
-        stderr_output = b""
-        
-        # Read stderr with timeout
-        try:
-            stderr_output, _ = self._process.stderr.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            self._process.stderr.close()
-            
-        stderr_text = stderr_output.decode("utf-8", errors="replace")
+        # Get stderr text from collected output
+        with self._stderr_lock:
+            stderr_text = b"".join(self._stderr_output).decode("utf-8", errors="replace")
         
         # Parse video dimensions
         width = self.analysis_width
         height = self.analysis_height
+        
         duration = None
         avg_frame_rate = None
         pixel_format = self.pix_fmt
         stream_index = 0
         
-        # Try to extract duration
-        duration_match = re.search(r"Duration:\s*(\d+):(\d+):(\d+)[.,](\d+)", stderr_text)
-        if duration_match:
-            hours, minutes, seconds, millis = duration_match.groups()
-            duration = int(hours) * 3600 + int(minutes) * 60 + int(seconds) + int(millis) / 1000.0
-            
-        # Try to extract frame rate
-        fps_match = re.search(r"Stream.*Video:.*(\d+(?:\.\d+)?)\s*(?:fps|tb)", stderr_text)
-        if fps_match:
-            avg_frame_rate = float(fps_match.group(1))
-            
-        # Fallback: try to get from video info line
-        if duration is None:
-            dur_match = re.search(r"Duration:\s*(\d+):(\d+):(\d+)[.,](\d+)", stderr_text)
-            if dur_match:
-                h, m, s, ms = dur_match.groups()
-                duration = int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000.0
+        # Try to extract duration - multiple patterns to try
+        duration_patterns = [
+            r"Duration:\\s*(\\d+):(\\d+):(\\d+)[.,](\\d+)",
+            r"duration:\\s*(\\d+(?:\\.\\d+)?)",
+        ]
+        
+        for pattern in duration_patterns:
+            duration_match = re.search(pattern, stderr_text, re.IGNORECASE)
+            if duration_match:
+                if len(duration_match.groups()) == 4:
+                    # Hours:Minutes:Seconds.millis format
+                    hours, minutes, seconds, millis = duration_match.groups()
+                    duration = int(hours) * 3600 + int(minutes) * 60 + int(seconds) + int(millis) / 1000.0
+                else:
+                    # Direct seconds format
+                    duration = float(duration_match.group(1))
+                break
                 
+        # Try to extract frame rate - multiple patterns
+        fps_patterns = [
+            r"(\\d+(?:\\.\\d+)?)\\s*(?:fps|fps,)",
+            r"Stream.*Video:.*(\\d+(?:\\.\\d+)?)\\s*tbr",
+            r"Stream.*Video:.*(\\d+(?:\\.\\d+)?)\\s*tb",
+        ]
+        
+        for pattern in fps_patterns:
+            fps_match = re.search(pattern, stderr_text, re.IGNORECASE)
+            if fps_match:
+                try:
+                    avg_frame_rate = float(fps_match.group(1))
+                    break
+                except (ValueError, IndexError):
+                    continue
+                    
         return VideoInfo(
             width=width,
             height=height,
@@ -163,6 +287,11 @@ class VideoDecoder:
             stream_index=stream_index,
         )
         
+    @property
+    def video_info(self) -> Optional[VideoInfo]:
+        """Return video information."""
+        return self._info
+    
     def stop(self) -> None:
         """Stop the FFmpeg process and clean up resources."""
         if self._process is not None:
@@ -172,22 +301,14 @@ class VideoDecoder:
                     self._process.wait(timeout=2)
                 except subprocess.TimeoutExpired:
                     self._process.kill()
+                    self._process.wait()
             self._process = None
             
-    def info(self) -> VideoInfo:
-        """Return video information."""
-        if self._info is None:
-            raise RuntimeError("Decoder not started")
-        return self._info
-        
-    def decode_frames(self) -> Iterator[tuple[int, float, bytes]]:
-        """Yield decoded frames with their index, timestamp, and data.
+    def __iter__(self) -> Iterator[tuple[np.ndarray, FrameInfo]]:
+        """Return an iterator over frames.
         
         Yields:
-            Tuple of (frame_index, timestamp_seconds, frame_data_bytes)
-            
-        Note: Timestamps are estimated based on frame rate when exact
-        presentation timestamps are not available.
+            Tuple of (frame: np.ndarray, info: FrameInfo)
         """
         if self._process is None:
             raise RuntimeError("Decoder not started")
@@ -196,7 +317,7 @@ class VideoDecoder:
             raise RuntimeError("Video info not available")
             
         frame_size = self.analysis_width * self.analysis_height
-        if not self.gray:
+        if self.pix_fmt != "gray":
             frame_size *= 3  # RGB24: 3 bytes per pixel
             
         info = self._info
@@ -218,7 +339,20 @@ class VideoDecoder:
                     # End of stream or error
                     break
                     
-                yield frame_index, timestamp, frame_data
+                # Convert bytes to numpy array
+                if self.pix_fmt == "gray":
+                    frame = np.frombuffer(frame_data, dtype=np.uint8).reshape((self.analysis_height, self.analysis_width))
+                else:
+                    frame = np.frombuffer(frame_data, dtype=np.uint8).reshape((self.analysis_height, self.analysis_width, 3))
+                
+                frame_info = FrameInfo(
+                    width=self.analysis_width,
+                    height=self.analysis_height,
+                    timestamp=timestamp,
+                    frame_index=frame_index,
+                )
+                
+                yield frame, frame_info
                 
                 frame_index += 1
                 timestamp += timestamp_increment
@@ -226,3 +360,15 @@ class VideoDecoder:
         finally:
             # Ensure process is cleaned up
             self.stop()
+    
+    def __next__(self) -> tuple[np.ndarray, FrameInfo]:
+        """Return the next frame from the iterator.
+        
+        Returns:
+            Tuple of (frame: np.ndarray, info: FrameInfo)
+        """
+        # Create iterator on first call
+        if not hasattr(self, '_iterator'):
+            self._iterator = self.__iter__()
+        
+        return next(self._iterator)
